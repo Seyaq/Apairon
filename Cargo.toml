@@ -1,0 +1,17 @@
+[package]
+name = "Apairon"
+edition = "2024"
+version = "0.1.2-beta"
+
+[lib]
+name = "apairon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "apairon"
+path = "src/main.rs"
+
+[[example]]
+name = "pacing_bench"
+path = "examples/pacing_bench.rs"
+test = true
