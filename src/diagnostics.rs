@@ -14,7 +14,8 @@ pub struct FrameTiming {
     pub frame: Duration,
     /// Time spent in simulation and frame callbacks.
     pub work: Duration,
-    /// Time spent waiting to honor the frame pacing target, as measured after the sleep.
+    /// Rest of the frame: the pacing wait including its oversleep, plus any driver overhead
+    /// (for example event pumping) before the next frame starts.
     pub wait: Duration,
 }
 
@@ -118,7 +119,10 @@ mod tests {
         assert_eq!(stats.frames(), 3);
         assert_eq!(stats.last(), timing(12, 0));
         assert_eq!(stats.max_frame(), Duration::from_millis(12));
-        assert_eq!(stats.average_frame(), Some(Duration::from_nanos(10_666_666)));
+        assert_eq!(
+            stats.average_frame(),
+            Some(Duration::from_nanos(10_666_666))
+        );
         assert_eq!(stats.average_work(), Some(Duration::from_millis(6)));
         assert_eq!(stats.average_wait(), Some(Duration::from_nanos(4_666_666)));
     }

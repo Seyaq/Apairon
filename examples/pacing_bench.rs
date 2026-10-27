@@ -179,7 +179,10 @@ fn run() -> Result<(), String> {
     );
     println!("  frames > 1.1x budget : {slow} ({:.2}%)", percent(slow));
     println!("  frames < 0.9x budget : {fast} ({:.2}%)", percent(fast));
-    println!("  frames > 2x budget   : {missed} ({:.2}%)", percent(missed));
+    println!(
+        "  frames > 2x budget   : {missed} ({:.2}%)",
+        percent(missed)
+    );
 
     if let Some(path) = csv_path {
         let mut text = String::from("frame_index,frame_time_ns\n");

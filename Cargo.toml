@@ -3,6 +3,14 @@ name = "Apairon"
 edition = "2024"
 version = "0.1.2-beta"
 
+[features]
+window = ["dep:winit"]
+
+[dependencies]
+# Optional native window. Justified by the need for an OS window and event loop, which
+# cannot be written portably with std alone.
+winit = { version = "0.30", optional = true }
+
 [lib]
 name = "apairon"
 path = "src/lib.rs"
@@ -15,3 +23,8 @@ path = "src/main.rs"
 name = "pacing_bench"
 path = "examples/pacing_bench.rs"
 test = true
+
+[[example]]
+name = "window"
+path = "examples/window.rs"
+required-features = ["window"]

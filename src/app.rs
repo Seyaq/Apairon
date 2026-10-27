@@ -1,17 +1,29 @@
-//! Application lifecycle and the engine loop.
+//! Application lifecycle and the engine core.
+//!
+//! The [`Engine`] is a frame stepper: it never waits on its own. A *driver* calls
+//! [`Engine::init`], then [`Engine::step`] repeatedly, waits for the returned [`Step::wait`]
+//! between frames, and finally calls [`Engine::shutdown`]. [`Engine::run`] is the headless
+//! driver; [`crate::shell::run_with_shell`] drives the engine alongside OS events.
 //!
 //! Lifecycle contract:
 //! 1. [`Application::init`] runs once. If it fails, [`Application::shutdown`] is NOT called:
 //!    `init` must release anything it partially acquired before returning an error.
-//! 2. The loop runs frames until the application requests exit, a callback fails, or the
-//!    configured frame limit is reached.
+//! 2. Frames run until the application requests exit, a callback fails, the driver stops, or
+//!    the configured frame limit is reached.
 //! 3. If `init` succeeded, [`Application::shutdown`] runs exactly once afterwards, including
-//!    when a callback returned an error. A panic inside a callback unwinds without calling
-//!    `shutdown`; the engine does not catch panics.
+//!    when a callback returned an error (drivers call [`Engine::shutdown`] on every path).
+//!    A panic inside a callback unwinds without calling `shutdown`; the engine does not
+//!    catch panics.
 //!
 //! Per frame: measure the real delta since the previous frame start, run the bounded number
-//! of fixed steps, run the variable-rate frame callback, then wait until the next scheduled
-//! frame start (see [`FramePacer`]). The first frame has a zero delta.
+//! of fixed steps, run the variable-rate frame callback, then report how long the driver
+//! should wait until the next scheduled frame start (see [`FramePacer`]). The first frame has
+//! a zero delta.
+//!
+//! Timing accounting: a frame is settled when the next frame starts (or at shutdown).
+//! `frame` is start-to-start, `work` is the callbacks' duration and `wait` is the remainder:
+//! the pacing wait including its oversleep and any driver overhead. The frames of a run
+//! therefore add up to the elapsed run time.
 
 use std::error::Error;
 use std::fmt;
@@ -123,7 +135,7 @@ impl fmt::Display for ConfigError {
 
 impl Error for ConfigError {}
 
-/// Error returned by [`Engine::run`], wrapping the application's own error.
+/// Error returned by the engine, wrapping the application's own error.
 #[derive(Debug)]
 pub enum EngineError<E> {
     /// [`Application::init`] failed.
@@ -132,6 +144,9 @@ pub enum EngineError<E> {
     FixedUpdate(E),
     /// [`Application::frame`] failed.
     Frame(E),
+    /// [`Engine::step`] or [`Engine::init`] was called outside the running phase
+    /// (before `init`, or after `shutdown`).
+    NotRunning,
 }
 
 impl<E: Error> fmt::Display for EngineError<E> {
@@ -140,6 +155,7 @@ impl<E: Error> fmt::Display for EngineError<E> {
             Self::Init(e) => write!(f, "application init failed: {e}"),
             Self::FixedUpdate(e) => write!(f, "fixed update failed: {e}"),
             Self::Frame(e) => write!(f, "frame callback failed: {e}"),
+            Self::NotRunning => write!(f, "engine is not running"),
         }
     }
 }
@@ -148,6 +164,7 @@ impl<E: Error + 'static> Error for EngineError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Init(e) | Self::FixedUpdate(e) | Self::Frame(e) => Some(e),
+            Self::NotRunning => None,
         }
     }
 }
@@ -159,6 +176,8 @@ pub enum ExitReason {
     RequestedByApplication,
     /// [`EngineConfig::max_frames`] was reached.
     FrameLimitReached,
+    /// The platform shell (the window) was closed by the user.
+    ShellClosed,
 }
 
 /// Summary of a completed run.
@@ -174,19 +193,44 @@ pub struct RunReport {
     pub exit_reason: ExitReason,
 }
 
-#[derive(Default)]
-struct Progress {
-    stats: FrameStats,
-    fixed_steps: u64,
-    dropped_time: Duration,
+/// Outcome of one [`Engine::step`], telling the driver what to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Step {
+    /// How long the driver should wait before stepping again. Zero when no wait is needed.
+    ///
+    /// Also set on the final step of a frame-limited run, so that the last frame is paced
+    /// like the others. A driver stopping anyway may skip it.
+    pub wait: Duration,
+    /// `Some` when the driver must stop after this step.
+    pub stop: Option<ExitReason>,
 }
 
-/// The engine loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Created,
+    Running,
+    Stopped,
+}
+
+/// A finished frame whose total duration is not known until the next frame starts.
+#[derive(Debug, Clone, Copy)]
+struct PendingFrame {
+    start: Duration,
+    work: Duration,
+}
+
+/// The engine core: a frame stepper with an explicit lifecycle.
 #[derive(Debug)]
 pub struct Engine {
     max_frames: Option<u64>,
     pacer: FramePacer,
     stepper: FixedStepper,
+    phase: Phase,
+    frame_index: u64,
+    previous_frame: Option<PendingFrame>,
+    stats: FrameStats,
+    fixed_steps: u64,
+    dropped_time: Duration,
 }
 
 impl Engine {
@@ -213,105 +257,166 @@ impl Engine {
             max_frames: config.max_frames,
             pacer,
             stepper,
+            phase: Phase::Created,
+            frame_index: 0,
+            previous_frame: None,
+            stats: FrameStats::new(),
+            fixed_steps: 0,
+            dropped_time: Duration::ZERO,
         })
     }
 
-    /// Runs the application to completion. See the module docs for the lifecycle contract.
+    /// `true` between a successful [`Engine::init`] and [`Engine::shutdown`].
+    pub fn is_running(&self) -> bool {
+        self.phase == Phase::Running
+    }
+
+    /// Runs [`Application::init`]. A no-op if the engine is already running; an error if it
+    /// was already shut down. If the application's `init` fails, the engine stays in its
+    /// initial phase and [`Engine::shutdown`] will not call [`Application::shutdown`].
+    pub fn init<A: Application>(&mut self, app: &mut A) -> Result<(), EngineError<A::Error>> {
+        match self.phase {
+            Phase::Running => Ok(()),
+            Phase::Stopped => Err(EngineError::NotRunning),
+            Phase::Created => {
+                app.init().map_err(EngineError::Init)?;
+                self.phase = Phase::Running;
+                Ok(())
+            }
+        }
+    }
+
+    /// Runs one frame without waiting and tells the driver what to do next.
     ///
-    /// On error, the partial statistics are discarded.
+    /// Returns [`EngineError::NotRunning`] outside the running phase. After an error the
+    /// driver must still call [`Engine::shutdown`].
+    pub fn step<A, C>(&mut self, app: &mut A, clock: &C) -> Result<Step, EngineError<A::Error>>
+    where
+        A: Application,
+        C: Clock,
+    {
+        if self.phase != Phase::Running {
+            return Err(EngineError::NotRunning);
+        }
+
+        let frame_start = clock.now();
+        let delta = self.settle_previous_frame(frame_start);
+
+        let plan = self.stepper.advance(delta);
+        self.dropped_time = self.dropped_time.saturating_add(plan.dropped);
+
+        let mut exit_requested = false;
+        for _ in 0..plan.steps {
+            self.fixed_steps = self.fixed_steps.saturating_add(1);
+            let control = app
+                .fixed_update(self.stepper.step())
+                .map_err(EngineError::FixedUpdate)?;
+            if control == Control::Exit {
+                exit_requested = true;
+                break;
+            }
+        }
+
+        if !exit_requested {
+            let ctx = FrameContext {
+                frame_index: self.frame_index,
+                delta,
+                interpolation_alpha: self.stepper.alpha(),
+            };
+            exit_requested = app.frame(&ctx).map_err(EngineError::Frame)? == Control::Exit;
+        }
+
+        let work_end = clock.now();
+        self.previous_frame = Some(PendingFrame {
+            start: frame_start,
+            work: work_end.saturating_sub(frame_start),
+        });
+        self.frame_index = self.frame_index.saturating_add(1);
+
+        // No point waiting when the loop is about to stop.
+        if exit_requested {
+            return Ok(Step {
+                wait: Duration::ZERO,
+                stop: Some(ExitReason::RequestedByApplication),
+            });
+        }
+
+        let wait = self.pacer.plan_wait(frame_start, work_end);
+        let limit_reached = self.max_frames.is_some_and(|max| self.frame_index >= max);
+        Ok(Step {
+            wait,
+            stop: limit_reached.then_some(ExitReason::FrameLimitReached),
+        })
+    }
+
+    /// Settles the last frame at the current time and runs [`Application::shutdown`] if the
+    /// engine is running. A no-op otherwise, so drivers can call it on every path.
+    pub fn shutdown<A, C>(&mut self, app: &mut A, clock: &C)
+    where
+        A: Application,
+        C: Clock,
+    {
+        if self.phase != Phase::Running {
+            return;
+        }
+        self.settle_previous_frame(clock.now());
+        app.shutdown();
+        self.phase = Phase::Stopped;
+    }
+
+    /// Builds a report from the statistics gathered so far.
+    pub fn report(&self, exit_reason: ExitReason) -> RunReport {
+        RunReport {
+            stats: self.stats.clone(),
+            fixed_steps: self.fixed_steps,
+            dropped_time: self.dropped_time,
+            exit_reason,
+        }
+    }
+
+    /// Headless driver: runs the application to completion, sleeping on `clock` between
+    /// frames. On error, the partial statistics are discarded.
     pub fn run<A, C>(mut self, app: &mut A, clock: &C) -> Result<RunReport, EngineError<A::Error>>
     where
         A: Application,
         C: Clock,
     {
-        app.init().map_err(EngineError::Init)?;
-
-        let mut progress = Progress::default();
-        let result = self.run_loop(app, clock, &mut progress);
-        app.shutdown();
-
-        let exit_reason = result?;
-        Ok(RunReport {
-            stats: progress.stats,
-            fixed_steps: progress.fixed_steps,
-            dropped_time: progress.dropped_time,
-            exit_reason,
-        })
+        self.init(app)?;
+        let outcome = self.drive(app, clock);
+        self.shutdown(app, clock);
+        let exit_reason = outcome?;
+        Ok(self.report(exit_reason))
     }
 
-    fn run_loop<A, C>(
-        &mut self,
-        app: &mut A,
-        clock: &C,
-        progress: &mut Progress,
-    ) -> Result<ExitReason, EngineError<A::Error>>
+    fn drive<A, C>(&mut self, app: &mut A, clock: &C) -> Result<ExitReason, EngineError<A::Error>>
     where
         A: Application,
         C: Clock,
     {
-        let mut previous_frame_start: Option<Duration> = None;
-        let mut frame_index: u64 = 0;
-
         loop {
-            let frame_start = clock.now();
-            let delta = previous_frame_start
-                .map_or(Duration::ZERO, |previous| frame_start.saturating_sub(previous));
-            previous_frame_start = Some(frame_start);
-
-            let plan = self.stepper.advance(delta);
-            progress.dropped_time = progress.dropped_time.saturating_add(plan.dropped);
-
-            let mut exit_requested = false;
-            for _ in 0..plan.steps {
-                progress.fixed_steps = progress.fixed_steps.saturating_add(1);
-                let control = app
-                    .fixed_update(self.stepper.step())
-                    .map_err(EngineError::FixedUpdate)?;
-                if control == Control::Exit {
-                    exit_requested = true;
-                    break;
-                }
+            let step = self.step(app, clock)?;
+            if !step.wait.is_zero() {
+                clock.sleep(step.wait);
             }
-
-            if !exit_requested {
-                let ctx = FrameContext {
-                    frame_index,
-                    delta,
-                    interpolation_alpha: self.stepper.alpha(),
-                };
-                exit_requested = app.frame(&ctx).map_err(EngineError::Frame)? == Control::Exit;
-            }
-
-            let work_end = clock.now();
-            let work = work_end.saturating_sub(frame_start);
-
-            // No point waiting when the loop is about to stop.
-            let wait = if exit_requested {
-                Duration::ZERO
-            } else {
-                let remaining = self.pacer.plan_wait(frame_start, work_end);
-                if remaining.is_zero() {
-                    Duration::ZERO
-                } else {
-                    clock.sleep(remaining);
-                    clock.now().saturating_sub(work_end)
-                }
-            };
-
-            progress.stats.record(FrameTiming {
-                frame: work.saturating_add(wait),
-                work,
-                wait,
-            });
-            frame_index = frame_index.saturating_add(1);
-
-            if exit_requested {
-                return Ok(ExitReason::RequestedByApplication);
-            }
-            if self.max_frames.is_some_and(|max| frame_index >= max) {
-                return Ok(ExitReason::FrameLimitReached);
+            if let Some(reason) = step.stop {
+                return Ok(reason);
             }
         }
+    }
+
+    /// Records the previous frame, if any, now that its end is known. Returns its duration,
+    /// which is the delta of the frame starting at `end`.
+    fn settle_previous_frame(&mut self, end: Duration) -> Duration {
+        let Some(previous) = self.previous_frame.take() else {
+            return Duration::ZERO;
+        };
+        let frame = end.saturating_sub(previous.start);
+        self.stats.record(FrameTiming {
+            frame,
+            work: previous.work.min(frame),
+            wait: frame.saturating_sub(previous.work),
+        });
+        frame
     }
 }
 
@@ -362,7 +467,11 @@ mod tests {
 
         fn init(&mut self) -> Result<(), TestError> {
             self.events.push("init");
-            if self.fail_init { Err(TestError) } else { Ok(()) }
+            if self.fail_init {
+                Err(TestError)
+            } else {
+                Ok(())
+            }
         }
 
         fn fixed_update(&mut self, _step: Duration) -> Result<Control, TestError> {
@@ -494,19 +603,31 @@ mod tests {
 
         let cases = [
             (
-                EngineConfig { target_fps: Some(0), ..valid.clone() },
+                EngineConfig {
+                    target_fps: Some(0),
+                    ..valid.clone()
+                },
                 ConfigError::InvalidTargetFps(0),
             ),
             (
-                EngineConfig { fixed_step: Duration::ZERO, ..valid.clone() },
+                EngineConfig {
+                    fixed_step: Duration::ZERO,
+                    ..valid.clone()
+                },
                 ConfigError::ZeroFixedStep,
             ),
             (
-                EngineConfig { max_fixed_steps_per_frame: 0, ..valid.clone() },
+                EngineConfig {
+                    max_fixed_steps_per_frame: 0,
+                    ..valid.clone()
+                },
                 ConfigError::ZeroMaxFixedSteps,
             ),
             (
-                EngineConfig { max_frames: Some(0), ..valid },
+                EngineConfig {
+                    max_frames: Some(0),
+                    ..valid
+                },
                 ConfigError::ZeroMaxFrames,
             ),
         ];
@@ -542,8 +663,7 @@ mod tests {
         }
 
         fn sleep(&self, duration: Duration) {
-            self.inner
-                .advance(duration.saturating_add(self.overshoot));
+            self.inner.advance(duration.saturating_add(self.overshoot));
         }
     }
 
@@ -600,5 +720,44 @@ mod tests {
         let average = report.stats.average_frame().expect("frames were recorded");
         assert!(average >= Duration::from_nanos(4_166_666));
         assert!(average <= Duration::from_nanos(4_167_666));
+    }
+
+    #[test]
+    fn step_before_init_is_rejected_and_shutdown_is_a_no_op() {
+        let clock = ManualClock::new();
+        let mut app = TestApp::new(&clock, Duration::from_millis(1));
+        let mut engine = Engine::new(config(None, 10, 8, 10)).expect("valid config");
+
+        assert!(matches!(
+            engine.step(&mut app, &clock),
+            Err(EngineError::NotRunning)
+        ));
+        engine.shutdown(&mut app, &clock);
+
+        assert!(app.events.is_empty());
+        assert!(!engine.is_running());
+    }
+
+    #[test]
+    fn init_is_idempotent_and_shutdown_settles_the_last_frame() {
+        let clock = ManualClock::new();
+        let mut app = TestApp::new(&clock, Duration::from_millis(3));
+        let mut engine = Engine::new(config(None, 10, 8, 10)).expect("valid config");
+
+        engine.init(&mut app).expect("init succeeds");
+        engine.init(&mut app).expect("second init is a no-op");
+        assert!(engine.is_running());
+        engine.step(&mut app, &clock).expect("first step");
+        engine.step(&mut app, &clock).expect("second step");
+        engine.shutdown(&mut app, &clock);
+        engine.shutdown(&mut app, &clock);
+
+        assert_eq!(app.events, vec!["init", "shutdown"]);
+        let report = engine.report(ExitReason::FrameLimitReached);
+        assert_eq!(report.stats.frames(), 2);
+        assert!(matches!(
+            engine.init(&mut app),
+            Err(EngineError::NotRunning)
+        ));
     }
 }

@@ -148,7 +148,10 @@ mod tests {
     #[test]
     fn unlimited_never_waits() {
         let mut pacer = FramePacer::unlimited();
-        assert_eq!(pacer.plan_wait(Duration::ZERO, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            pacer.plan_wait(Duration::ZERO, Duration::ZERO),
+            Duration::ZERO
+        );
         assert_eq!(pacer.plan_wait(ms(5), ms(50)), Duration::ZERO);
     }
 

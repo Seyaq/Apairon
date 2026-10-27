@@ -2,9 +2,7 @@ use std::convert::Infallible;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use apairon::{
-    Application, Clock, Control, Engine, EngineConfig, FrameContext, MonotonicClock,
-};
+use apairon::{Application, Clock, Control, Engine, EngineConfig, FrameContext, MonotonicClock};
 
 /// Number of frames the demo runs before exiting.
 const DEMO_FRAMES: u64 = 480;
@@ -54,7 +52,10 @@ fn main() -> ExitCode {
             println!("avg work        : {:?}", report.stats.average_work());
             println!("avg wait        : {:?}", report.stats.average_wait());
             println!("max frame       : {:?}", report.stats.max_frame());
-            println!("fixed steps     : {} (app counted {})", report.fixed_steps, app.fixed_ticks);
+            println!(
+                "fixed steps     : {} (app counted {})",
+                report.fixed_steps, app.fixed_ticks
+            );
             println!("dropped sim time: {:?}", report.dropped_time);
             ExitCode::SUCCESS
         }
